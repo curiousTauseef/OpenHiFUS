@@ -34,7 +34,7 @@ import serial
 import struct
 import time
 import multiprocessing
-import cv2
+#import cv2
 
 try:
     import pyopencl as cl
@@ -49,10 +49,13 @@ from guiqwt.builder import make
 #from guiqwt.tools import ContrastPanelTool
 #see guiqwt.image.RawImageItem  for additional methods on image adjustment
 
+from matplotlib import pyplot as plt
 
-FIXEDSIZE = True
-MULTIPROCESS = True
-USEOCL = False
+FIXEDSIZE = False
+MULTIPROCESS = False
+USEOCL = True
+UPSAMPLE = True
+
 
 #SEE END OF FILE FOR HARDWARE IMPORT
 
@@ -416,7 +419,7 @@ class BModeWindow(QWidget):
         #plot.set_active_item(self.currentImage)
 
         self.curClock = self.fpsClock()
-        self.frameRate = 2.0 / ( self.curClock-self.preClock)
+        self.frameRate = 1.0 / ( self.curClock-self.preClock)
         self.frameRateLabel.setText('{:.1f}'.format(self.frameRate))
         self.preClock = self.curClock
 
@@ -1142,6 +1145,102 @@ class simpleCurveDialog(CurveDialog):
         pass
 
 
+clkernel = """
+#pragma OPENCL EXTENSION cl_khr_fp64: enable
+
+__kernel void UpSam2(__global unsigned short* Data, __global unsigned short* Data2)
+{
+    // Upsamples the buffers by 2. Interpolates linearly. Last digit is repeated
+    // Eg  2 4 6 would become 2 3 4 5 6 6
+    
+    // Get the Thread ID to know wich pixel it is working on
+    unsigned int yy = get_global_id(0);
+    //unsigned int ys = get_global_size(0);
+    unsigned int xx = get_global_id(1);
+    // Get the max X size to be able to go from 2D index to 1D index 
+    unsigned int xs = get_global_size(1);
+    
+    // Create vars for iterating
+    int idx = yy*xs+xx;
+    Data2[2*idx] = Data[idx];
+
+    if ( xx == (xs-1) )
+    {
+        // You are on next record, so just copy previous value
+        Data2[2*idx+1] = Data[idx];
+    }
+    else
+    {
+        Data2[2*idx+1] = (Data[idx] + Data[idx+1]) / 2 ;
+    }
+}
+
+__kernel void RenderImg(__global unsigned short* Data, __global double* Image, __global unsigned int* DelIdx, __constant unsigned int* DAQParam)
+{
+    // Get the Thread ID to know wich pixel it is working on
+    unsigned int yy = get_global_id(0);
+    //unsigned int ys = get_global_size(0);
+    unsigned int xx = get_global_id(1);
+    // Get the max X size to be able to go from 2D index to 1D index 
+    unsigned int xs = get_global_size(1);
+    // Create vars for iterating
+    int nn;
+
+    // Index (pointers) for the [Data]
+    int BufPos = 0;
+    int RecPos = 0;
+    int NextPos = 0;
+    long int PixVal = 0;
+
+    // Extract the Parameters from the compact structure
+    int nElems = DAQParam[0];
+    int nSamples = DAQParam[1];
+    int BuffLen = DAQParam[2];
+    int ScaleFactor = DAQParam[3];
+    int ActiveFrame = DAQParam[4];
+
+    // Offset of half a buffer as we are aquiering with 2 channels
+    int Ch2Offset = BuffLen/2;
+
+    // Output value
+    double log10val;
+
+    // Loop over each element
+    for (nn = 0; nn<nElems; nn++)
+    {
+        BufPos = (ActiveFrame * (nElems/2) + nn%32) ; //Buffer number to be used
+        RecPos = xx * nSamples + yy * ScaleFactor + DelIdx[xx * nElems + nn] + Ch2Offset * (nn>=32) ;
+        // Find the "start" position for angle xx, at a depth of yy, for element nn. (It will be the record shifted by DelIdx)
+        
+        NextPos = (xx+1) * nSamples + Ch2Offset * (nn>=32); // This is the next record!
+        
+        if ((RecPos) >= NextPos)
+        // You're on next record
+        {
+            PixVal += 0;
+        }
+        else
+        {
+            PixVal += Data[BufPos * BuffLen + RecPos] - 32768; //To zero the offset accumulated
+        }
+    }
+
+    // TODO @Michael Temporary until IQ demodulated Data is used
+    PixVal = abs(PixVal);
+
+    //Image[yy*xs+xx] = yy*xs+xx * 1.0;
+    //Image[yy*xs+xx] = yy*xs+xx;
+    
+    log10val = log10( (double)PixVal ) ;
+    //log10val = (double)(Data[BufPos * BuffLen + RecPos] - 32768) ;
+    Image[yy*xs+xx] = max(log10val, 0.0); // Write the pixel value
+    
+
+}
+"""
+
+
+
 class HiFUSData(QObject):
 
     def __init__(self, parent=None, UseOCL=USEOCL):
@@ -1155,41 +1254,90 @@ class HiFUSData(QObject):
         self.emitM  = False
         self.emitRF = False
 
+        self.useCL = False
+
+        Elements = 64
+        maxAngles = 35
+        Focals = [8.0e-3]
+
+        # General Parameters
+        self.nElements = Elements
+        self.Elements = range(self.nElements)
+
+        self.maxAngles = maxAngles
+        self.Angles = range(-self.maxAngles,self.maxAngles)
+        self.nAngles = len(self.Angles)
+
+        self.Focals = Focals #[6e-3, 8e-3, 12e-3]]
+        self.nFocals = len(self.Focals)
+
+
         #------------------------------
         #Setup acqusition buffers
         #------------------------------
 
         #TO DO: get these parameters from a configuration file
-        bufferCnt=20
-        recordCnt=100
-        sampleCnt=4160
-        DAQ.SetBufferRecordSampleCount(bufferCnt,recordCnt,sampleCnt)
+        bufferCnt = 64
+        sampleCnt = 320 * 5
+
+        #TODO @Jeff How do I access number of channels
 
         trigDelay = 6.0E-03*(2.0/1500.)
         DAQ.SetTriggerDelaySec(trigDelay)
 
         #Store settings
+
+        self.nChannels = 2 # Number of active channels that can aquire Data
+        DAQ.SetChannelCount(self.nChannels)
+
         self.numBuffers   = bufferCnt
-        self.recordCnt    = recordCnt
+        self.recordCnt    = self.nFocals * self.nAngles * self.nChannels #TODO =70 Increase to 210. Did not implement 3 focal depth yet
         self.recordLength = sampleCnt
+
+        DAQ.SetBufferRecordSampleCount(self.numBuffers, self.recordCnt, self.recordLength)
+
 
         #Handle to acquisition board
         self.boardHandle = DAQ.GetBoardHandle(1,1)
 
         #Acquisition sample rate
-        self.sampleRate  = DAQ.GetSampleRate()
+        self.sampleRate  = DAQ.GetSampleRate() #TODO @Jeff Does this return a number, if so, it can replace line below
+
+        self.Offset = 500.0e-9 # Delay offset from master trigger to triggers
+        self.SamplingRate = 500e6 # 500 Mega Samples Per Second
 
         #Acquisition frame rate
         #This is a nominal value, and should come from a configuration file
-        self.frameRate     = 95.0;
+        self.frameRate     = 48.0;
 
         #Memory buffers
         self.bufIndex = 0
-        self.bufPerAcq   = 1
-        self.numBuffers  = bufferCnt
-        self.lenBuffers  = DAQ.GetBufferLength()
+        self.bufPerAcq   = 32
+        self.lenBuffers  = DAQ.GetBufferLength() # Should be ==> self.nSamples * self.nRecords * self.nChannels
         self.buffers     = numpy.empty([self.numBuffers,self.lenBuffers], dtype=numpy.uint16, order='C')
+        self.data    = numpy.empty([self.numBuffers,self.lenBuffers*2], dtype=numpy.uint16, order='C')
         self.bufferCheck = DAQ.CheckBufferSize(self.boardHandle, self.buffers)
+
+
+
+        self.Frames = self.numBuffers / 32
+        self.ActiveFrame = 0
+
+
+        self._calcDelays()
+
+
+#        self.Imagenx = self.nAngles
+        self.BLines = self.nAngles
+        i = 1
+        while (self.recordLength/i >= 2*self.BLines) or not int(self.recordLength/float(i))==(self.recordLength/float(i)):
+            i += 1
+#        self.Imageny = self.recordLength / i
+        self.BLength = self.recordLength / i
+#        self.Image = numpy.zeros((self.Imageny, self.Imagenx), dtype = numpy.uint)
+        self.BData   = numpy.zeros([self.BLength,self.BLines], dtype=numpy.double)
+
+        self.ScaleFactor = self.recordLength / self.BLength
 
         #Create shared array for child process, 'H' designates unsigned short
         self._shBuffersArr = multiprocessing.Array('H',self.buffers.size)
@@ -1198,13 +1346,15 @@ class HiFUSData(QObject):
 
         #Temporary demodulated/envelope data array
         self.decimation  = DAQ.GetDecimation()
-        self.envData     = numpy.empty([1,self.lenBuffers/self.decimation], \
-                                        dtype=numpy.double, order='C')
+#        self.envData     = self.Image = numpy.zeros((self.Imageny, self.Imagenx), dtype = numpy.uint32)
+
+#        numpy.empty([1,self.lenBuffers/self.decimation], \
+#                                        dtype=numpy.double, order='C')
 
         #BMode data
-        self.BLength = self.recordLength / self.decimation
-        self.BLines  = self.recordCnt
-        self.BData   = numpy.zeros([self.BLength,self.BLines], dtype=numpy.double)
+#        self.BLength = self.recordLength / self.decimation
+#        self.BLines  = self.recordCnt
+#        self.BData   = numpy.zeros([self.BLength,self.BLines], dtype=numpy.double)
 
         self._shBDataArr = multiprocessing.Array('d',self.BData.size)
         self.shBData     = numpy.frombuffer(self._shBDataArr.get_obj(),dtype='d')
@@ -1262,7 +1412,6 @@ class HiFUSData(QObject):
         self.shRFData     = self.shRFData.reshape(self.RFData.shape,order='C')
         self.shRFData[:]  = self.RFData[:]
 
-
         #Start a child process to handle the actual data collection
         if MULTIPROCESS == True:
             self.parentSocket, self.childSocket = multiprocessing.Pipe()
@@ -1274,7 +1423,7 @@ class HiFUSData(QObject):
                                                               self._shBVideoArr,  self.BVideo.shape, \
                                                               self._shMDataArr,   self.MData.shape, \
                                                               self._shRFDataArr,  self.RFData.shape,
-                                                              bufferCnt, recordCnt, sampleCnt, trigDelay])
+                                                              self.numBuffers, self.recordCnt, self.recordLength, trigDelay])
 
 
             self.childProcess.daemon=True
@@ -1285,10 +1434,11 @@ class HiFUSData(QObject):
         #end MULTIPROCESS == True
 
         #Optional OpenCL for GPU based processing
-        self.useCL = False
+
         if UseOCL:
             self._initCL()
-        pass
+
+
 
     def setBMode(self):
         self.emitB  = True
@@ -1411,6 +1561,37 @@ class HiFUSData(QObject):
             DAQ.IQDemodulateAvg(self.buffers, self.envData, self.bufIndex-1, average=self.BAverage, gain=self.timeGain)
         dataToBMode(self.envData, self.BData, self.BLength, self.BLines)
 
+    def _calcDelays(self):
+        c = 1.54e3 # Speed of cound in water
+        ep = 3.8e-5 # Element Pitch
+
+        self.Delay = numpy.zeros((self.recordCnt * self.nElements), dtype=numpy.long)
+        # Vector is used as it is easier to upload to Flash
+
+        self.DelIdx = numpy.zeros((self.recordCnt, self.nElements), dtype=numpy.uint)
+        # Matrix, although it is a vector anyways when it goes to GPU
+
+        if UPSAMPLE:
+            dt = 1.0 / (self.SamplingRate * 2.0) # *2 because we up sampled
+        else:
+            dt = 1.0 / self.SamplingRate
+        
+        iele = -1 # index of Elements
+        for ele in self.Elements:
+            iele += 1
+            ifoc = -1 # index of Focals
+            for foc in self.Focals:
+                ifoc += 1
+                iang = -1 # index of Angles
+                for ang in self.Angles:
+                    iang += 1
+                    tmp = self.Offset + (foc-numpy.sqrt((foc*numpy.sin(numpy.radians(90+ang)))**2+(foc*numpy.cos(numpy.radians(90+ang))-(32-ele)*ep)**2))/(c)
+                    # print int(Delay/dt)
+                    self.Delay[iele*self.nFocals + ifoc*self.nAngles + iang] = tmp
+                    self.DelIdx[ifoc*self.nAngles + iang,iele] = tmp / dt
+        if (self.useCL):
+            cl.enqueue_write_buffer(self.clQueue, self.DelIdx_buf, self.DelIdx)
+
     def _initCL(self):
         #Check openCL version
         try:
@@ -1420,31 +1601,30 @@ class HiFUSData(QObject):
         except:
             raise Exception('Please install PyOpenCL or set UseOpenCL=False !' )
         del clv
-        
+
         # create an OpenCL context
-        myplatform = cl.get_platforms()
-        mygpudevices = myplatform[0].get_devices(device_type=cl.device_type.GPU)
-        self.clCtx = cl.Context(devices = mygpudevices)
+        my_platform = cl.get_platforms()
+        my_gpu_devices = my_platform[0].get_devices(device_type=cl.device_type.GPU)
+        self.clCtx = cl.Context(devices = my_gpu_devices)
         self.clQueue = cl.CommandQueue(self.clCtx)
-        self.clLoadProgram("IQDemod.cl")
-
         self.useCL = True
+
+        # for Data (input), we need to specify that this buffer should be populated from buffers
+        self.buffers_buf = cl.Buffer(self.clCtx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=self.buffers)
+        self.data_buf = cl.Buffer(self.clCtx, cl.mem_flags.READ_WRITE, self.data.nbytes)
+        # for Image (output), we just allocate an empty buffer
+        self.Image_buf = cl.Buffer(self.clCtx, cl.mem_flags.WRITE_ONLY, self.BData.nbytes)
+        self.DelIdx_buf = cl.Buffer(self.clCtx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=self.DelIdx)
+
+        if UPSAMPLE:
+            self.DAQParam = numpy.array([self.nElements, self.recordLength*2, self.lenBuffers*2, self.ScaleFactor*2, self.ActiveFrame], dtype = numpy.uint) # With upsampling
+        else:
+            self.DAQParam = numpy.array([self.nElements, self.recordLength, self.lenBuffers, self.ScaleFactor, self.ActiveFrame], dtype = numpy.uint) # Without upsampling
         
-        mf = cl.mem_flags
+        self.DAQParam_buf = cl.Buffer(self.clCtx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=self.DAQParam)
 
-        #Create OpenCL arrays
-        
-        self._clBuffers = cl.Buffer(self.clCtx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=self.buffers)
-        self._clEnvData = cl.Buffer(self.clCtx, mf.WRITE_ONLY, self.envData.nbytes)
-        self._clTimeGain = cl.Buffer(self.clCtx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=numpy.array(self.timeGain, dtype=numpy.double))
-
-        DAQParams = numpy.array([self.numBuffers, self.lenBuffers, self.recordCnt, self.recordLength], dtype=numpy.int)
-        self.DAQParams_buf = cl.Buffer(self.clCtx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=DAQParams)
-
-        # Define OCL Parameters [BufferIndex, NumAverage, UseGain, Decimate]
-        self.OCLParams = numpy.array([self.bufIndex-1, self.BAverage, True, self.decimation], dtype=numpy.int)
-        self.OCLParams_buf = cl.Buffer(self.clCtx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=self.OCLParams)
-        self.clThreads = (self.lenBuffers / self.decimation, 1)
+        self.Program = cl.Program(self.clCtx, clkernel).build()
+        self.clThreads = (self.BLength,self.BLines)
 
     def _clIQDemodulateAvg(self):
         cl.enqueue_write_buffer(self.clQueue, self._clBuffers, self.buffers)
@@ -1469,6 +1649,94 @@ class HiFUSData(QObject):
         #create the program
         self.program = cl.Program(self.clCtx, fstr).build()
 
+    def NextFrame(self):
+        if self.ActiveFrame == self.Frames:
+            self.ActiveFrame = 0
+        else:
+            self.ActiveFrame += 1
+
+
+    def RenderImage(self):
+#        print scaleFactor
+        if (self.useCL):
+            Image = self._RenderImgGPU()
+        else:
+            Image = self._RenderImgCPU()
+        # Temp variable Img to manipulate
+
+#        print Image.shape        
+        self.BData[:] = numpy.reshape(Image, self.BData.shape)
+        
+
+
+    def _RenderImgGPU(self):
+        t1 = time.time()
+        tmp = numpy.empty(self.data.size, dtype = numpy.uint16)
+        if not self.useCL:
+            raise Exception('Please install PyOpenCL or set UseOpenCL=False !')
+
+        cl.enqueue_write_buffer(self.clQueue, self.buffers_buf, self.buffers)
+
+        if UPSAMPLE:
+            Event = self.Program.UpSam2(self.clQueue, self.clThreads, None, self.buffers_buf, self.data_buf)
+            Event.wait()
+
+        self.DAQParam[4] = self.ActiveFrame
+        cl.enqueue_write_buffer(self.clQueue, self.DAQParam_buf, self.DAQParam).wait()
+#        print self.clThreads
+        if UPSAMPLE:
+            Event = self.Program.RenderImg(self.clQueue, self.clThreads, None, self.data_buf, self.Image_buf, self.DelIdx_buf, self.DAQParam_buf)
+        else:
+            Event = self.Program.RenderImg(self.clQueue, self.clThreads, None, self.buffers_buf, self.Image_buf, self.DelIdx_buf, self.DAQParam_buf)
+        Event.wait()
+        Img = numpy.empty([self.BLength,self.BLines], dtype = numpy.double)
+        cl.enqueue_copy(self.clQueue, Img, self.Image_buf)
+#        print time.time(), time.time() - t1
+
+        return Img
+
+    def _RenderImgCPU(self):
+        t1 = time.time()
+        Img = numpy.zeros([self.BLength,self.BLines], dtype = numpy.double)
+        ScaleFactor = self.ScaleFactor
+
+        Ch2Offset = len(self.buffers[0])/2
+        
+#        print self.buffers.size, len(self.buffers), len(self.buffers[0]),self.BLength,self.BLines
+#        print 'scaling', self.ScaleFactor
+        for yy in range(self.BLength): # Iterate over all pixels
+#            print 'Working on line', yy
+            for xx in range(self.BLines): #Over all angles
+#                print 'Working on pixel', yy, xx
+                PixVal = 0
+                for nn in range(self.nElements): # Each pixel takes data from each channel
+                    BufPos = self.ActiveFrame * (self.nElements/2) + nn%32 # Buffer number to be used
+                    RecPos = xx * self.recordLength + yy * self.ScaleFactor + self.DelIdx[xx, nn]  +  Ch2Offset * (nn>=32) #Delay Index for angle xx, for element nn
+                    NextPos = (xx+1) * self.recordLength + Ch2Offset * (nn>=32)
+                    
+#                    print 'element', nn, 'BP', BufPos
+#                    print self.DelIdx[xx, nn], RecPos, NextPos
+                    if (NextPos > (Ch2Offset*2) ):
+                        raise Exception ("Counting Error")
+
+#                    print self.buffers[BufPos, RecPos:RecPos+scaleFactor]
+                    if (RecPos) >= ( NextPos ): # You're on next record;
+                        PixVal += 2**15
+                    else:
+                        PixVal += self.buffers[BufPos, RecPos]
+#                        print 'adding', self.buffers[BufPos, RecPos]
+#                    print 'sum', PixVal / scaleFactor                
+                PixVal -= 2**15 * self.nElements # 2**15 is the "zero" for the DAQ, 64 channels
+#                print PixVal, self.buffers[BufPos, RecPos]
+                # TODO Demodulate to eliminate negative values.
+                PixVal = abs(PixVal)
+                Img[yy, xx] = max(numpy.log10(PixVal), 0)  # Add contribution of the Element
+                #Img[yy, xx] = max(PixVal, 0) 
+#                print 'pixel', yy, xx, PixVal, Img[yy, xx]
+#        print time.time() - t1
+        
+        return Img
+
 
     def _collectSP(self):
 
@@ -1490,7 +1758,7 @@ class HiFUSData(QObject):
             return
 
         acquireData = DAQ.AcquireBuffers
-        self.bufIndex = 0
+
         self.BVideoIndex = 0
         bufIndex  = self.bufIndex
         bufPerAcq = self.bufPerAcq
@@ -1503,13 +1771,11 @@ class HiFUSData(QObject):
                 self.alive = False
                 self.emit(SIGNAL('faildata'))
                 continue
-            bufIndex += bufPerAcq
-            bufIndex  = bufIndex % self.numBuffers
-            self.bufIndex = bufIndex
+            
 
             #Emit signal to replot in main GUI, provide data as argument
             if self.emitB == True:
-                self.processBData()
+                self.RenderImage()
                 self.BVideo[self.BVideoIndex,:,:] = self.BData[:,:]
                 self.BVideoIndex += 1
                 self.BVideoIndex = self.BVideoIndex % self.BVideoLength
@@ -1525,7 +1791,9 @@ class HiFUSData(QObject):
             if self.emitRF == True:
                 self.RFData[1,:] = self.buffers[bufIndex-1, self.RFDataStart:self.RFDataStop]*1.2210012210012e-02 - 398.73
                 self.emit(SIGNAL('newRFData'), self.RFData)
-
+            
+            #self.NextFrame()
+            #self.alive = False
             QApplication.processEvents()
 
         else:
@@ -1601,7 +1869,7 @@ class HiFUSData(QObject):
             self.parentSocket.send('idle')
             while(self.parentSocket.poll() == False):
                 QApplication.processEvents()
-            self.bufIndex = self.parentSocket.recv()                   
+            self.bufIndex = self.parentSocket.recv()
             self.emit(SIGNAL('stopped'))
             #Update all local arrays from shared arrays
             self.buffers[:] = self.shBuffers[:]
@@ -1787,7 +2055,7 @@ def CollectProcess(childSocket, \
 
         #Check if the parent wants new data
         #Optional frame skip incase display can't keep up with processing
-        if (bufIndex%2 == 0):
+        if (bufIndex%1 == 0):
             if childSocket.poll() == True:
                 cmd = childSocket.recv()
                 #First populate the shared array with new data
@@ -2073,7 +2341,6 @@ class DummyHardware(object):
         sigAmp = 50
         sigRange = 2**16
         tempRF = numpy.random.randint(-sigAmp, sigAmp, (bufPerAcq,buffers.shape[1]) ) + 0.5*sigRange
-
         buffers[a:b,:] = numpy.array(tempRF, dtype=buffers.dtype)
 
         return True
@@ -2167,6 +2434,8 @@ class DummyHardware(object):
 
         return True
 
+    def SetChannelCount(self, nChan):
+        return True
 
 def dataToBMode(data, imageData, imageDepth, imageLines):
     """ Function converts A scan lines into B mode image """
@@ -2509,10 +2778,12 @@ class MCU(serial.Serial):
         self._send(self.opCode['ECHO'], echoCode, self.fmtCode['ushort'])
         return self.readline()
 
-try:
-    import PyDaxAlazar as DAQ
-except:
-    DAQ = DummyHardware()
+#try:
+#    import PyDaxAlazar as DAQ
+#except:
+#    DAQ = DummyHardware()
+DAQ = DummyHardware()
+
 
 
 if __name__ == '__main__':
