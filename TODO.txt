@@ -1,0 +1,2 @@
+Implement sector plots for returned images.
+See http://tooloftrade.blogspot.ca/2011/09/plotting-polar-images-in-matlab.html for implementation.
