@@ -54,7 +54,7 @@ from matplotlib import pyplot as plt
 FIXEDSIZE = False
 MULTIPROCESS = False
 USEOCL = True
-UPSAMPLE = True
+UPSAMPLE = False # Not working yet
 
 
 #SEE END OF FILE FOR HARDWARE IMPORT
@@ -1159,7 +1159,8 @@ __kernel void UpSam2(__global unsigned short* Data, __global unsigned short* Dat
     unsigned int xx = get_global_id(1);
     // Get the max X size to be able to go from 2D index to 1D index 
     unsigned int xs = get_global_size(1);
-    
+
+    int temp;
     // Create vars for iterating
     int idx = yy*xs+xx;
     Data2[2*idx] = Data[idx];
@@ -1171,7 +1172,8 @@ __kernel void UpSam2(__global unsigned short* Data, __global unsigned short* Dat
     }
     else
     {
-        Data2[2*idx+1] = (Data[idx] + Data[idx+1]) / 2 ;
+        temp = (Data[idx] + Data[idx+1]) / 2;
+        Data2[2*idx+1] = (short) temp ;
     }
 }
 
@@ -1228,11 +1230,11 @@ __kernel void RenderImg(__global unsigned short* Data, __global double* Image, _
     // TODO @Michael Temporary until IQ demodulated Data is used
     PixVal = abs(PixVal);
 
-    //Image[yy*xs+xx] = yy*xs+xx * 1.0;
+    //Image[yy*xs+xx] = ( RecPos) * 1.0; //BufPos * BuffLen
     //Image[yy*xs+xx] = yy*xs+xx;
     
     log10val = log10( (double)PixVal ) ;
-    //log10val = (double)(Data[BufPos * BuffLen + RecPos] - 32768) ;
+    //log10val = (double)(BufPos * BuffLen + RecPos) ;
     Image[yy*xs+xx] = max(log10val, 0.0); // Write the pixel value
     
 
@@ -1315,7 +1317,7 @@ class HiFUSData(QObject):
         self.bufPerAcq   = 32
         self.lenBuffers  = DAQ.GetBufferLength() # Should be ==> self.nSamples * self.nRecords * self.nChannels
         self.buffers     = numpy.empty([self.numBuffers,self.lenBuffers], dtype=numpy.uint16, order='C')
-        self.data    = numpy.empty([self.numBuffers,self.lenBuffers*2], dtype=numpy.uint16, order='C')
+        self.data        = numpy.empty([self.numBuffers,self.lenBuffers*2], dtype=numpy.uint16, order='C')
         self.bufferCheck = DAQ.CheckBufferSize(self.boardHandle, self.buffers)
 
 
@@ -1612,6 +1614,7 @@ class HiFUSData(QObject):
         # for Data (input), we need to specify that this buffer should be populated from buffers
         self.buffers_buf = cl.Buffer(self.clCtx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=self.buffers)
         self.data_buf = cl.Buffer(self.clCtx, cl.mem_flags.READ_WRITE, self.data.nbytes)
+        self.data2_buf = cl.Buffer(self.clCtx, cl.mem_flags.READ_ONLY, self.data.nbytes)
         # for Image (output), we just allocate an empty buffer
         self.Image_buf = cl.Buffer(self.clCtx, cl.mem_flags.WRITE_ONLY, self.BData.nbytes)
         self.DelIdx_buf = cl.Buffer(self.clCtx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=self.DelIdx)
@@ -1676,16 +1679,25 @@ class HiFUSData(QObject):
             raise Exception('Please install PyOpenCL or set UseOpenCL=False !')
 
         cl.enqueue_write_buffer(self.clQueue, self.buffers_buf, self.buffers)
+        
+        print self.buffers
 
         if UPSAMPLE:
             Event = self.Program.UpSam2(self.clQueue, self.clThreads, None, self.buffers_buf, self.data_buf)
             Event.wait()
 
+            cl.enqueue_copy(self.clQueue, tmp, self.data_buf)
+            print 'upsampled', tmp
+
+            cl.enqueue_write_buffer(self.clQueue, self.data2_buf, tmp)
+            
+        
         self.DAQParam[4] = self.ActiveFrame
         cl.enqueue_write_buffer(self.clQueue, self.DAQParam_buf, self.DAQParam).wait()
 #        print self.clThreads
+
         if UPSAMPLE:
-            Event = self.Program.RenderImg(self.clQueue, self.clThreads, None, self.data_buf, self.Image_buf, self.DelIdx_buf, self.DAQParam_buf)
+            Event = self.Program.RenderImg(self.clQueue, self.clThreads, None, self.data2_buf, self.Image_buf, self.DelIdx_buf, self.DAQParam_buf)
         else:
             Event = self.Program.RenderImg(self.clQueue, self.clThreads, None, self.buffers_buf, self.Image_buf, self.DelIdx_buf, self.DAQParam_buf)
         Event.wait()
