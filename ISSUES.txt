@@ -1,0 +1,30 @@
+#TODO
+
+1 Upsampling buffers data
+1.1 DONE Create GPU kernel to upsample data
+1.2 DONE Implement changes to framework to use larger data buffer
+1.3 Implement changes into beamforming algorithms
+1.3.1 CPU Beamforming
+1.3.2 GPU Beamforming
+
+2 Change buffer/aquisition to aquire 32 channels before changing focal zones.
+2.1 Buffer Count and Record per Buffer will need to be changed
+2.2 Beamforming algorithms need to be updated to reflect new references
+2.2.1 CPU Beamforming
+2.2.2 GPU Beamforming
+
+3 Continuous recieve beamforming needs to be implemented.
+3.1 Change delay making program (_calcDelays) to return a matrix instead of a vector
+3.2 Update beamforming algorithms to take new delay index
+3.2.1 CPU Beamforming
+3.2.2 GPU Beamforming
+
+4 Demodulate data after beamforming. 
+4.1 Change framework to beamform full data
+4.2 Implement IQ demodulation, decimate during demodulation
+
+5 Use more complex beamforming algorithms
+
+...
+
+99 Push changes back to OpenHiFUS main brach (j-leadbetter/OpenHiFUS)
