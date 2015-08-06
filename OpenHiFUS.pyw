@@ -1,7 +1,8 @@
 """
 OpenHiFUS
-Copyright 2012-2013 Jeff Leadbetter
+Copyright 2012-2014 Jeff Leadbetter
 jeff.leadbetter@dal.ca
+jeff.leadbetter@daxsonics.com
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -18,8 +19,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
 #Title: OpenHiFUS
-version='1.03'
-#Date: August 6, 2013
+version='1.05'
+#Date: May 13, 2014
 #Python Version 2.7.2
 
 import os
@@ -30,10 +31,12 @@ from PyQt4.QtGui import *
 
 import numpy
 import numpy.random
-import serial
+import scipy.stats
 import struct
 import time
 import multiprocessing
+
+import serial
 import cv2
 
 try:
@@ -67,26 +70,65 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("OpenHiFUS "+version)
 
+        #All imaging modes access the same data object
+        #This is owned by the MainScanWindow widget and
+        #referenced by the individual image mode widgets
+        self.dataObject = HiFUSData()
+
         #Set central widget - Main Scan window
-        self.mainWindow = MainScanWindow()
+        self.mainWindow = MainScanWindow(self. dataObject)
         self.setCentralWidget(self.mainWindow)
 
         #Set main toolbar
         mainToolBar = self.addToolBar("Tools")
 
+        ############
+        #DockWidgets
+        ############
+        dockPalette = QPalette()
+        dockPalette.setColor(QPalette.Window, Qt.black)
+        dockPalette.setColor(QPalette.WindowText, Qt.white)
+
+        #Session Information
+        self.infoWidget = SessionInfoWidget(self.dataObject)
+        self.infoWidget.setAutoFillBackground(True)
+        
+        infoDockWidget = QDockWidget('Session Information', self)
+        infoDockWidget.setObjectName('infoDockWidget')
+        infoDockWidget.setAllowedAreas(Qt.LeftDockWidgetArea)
+        infoDockWidget.setWidget(self.infoWidget)
+        self.addDockWidget(Qt.LeftDockWidgetArea, infoDockWidget)
+
+        #Image Control Widget
+        self.contrastWidget = ContrastWidget()
+        self.contrastWidget.setAutoFillBackground(True)
+        
+        contrastDockWidget = QDockWidget('Image Settings', self)
+        contrastDockWidget.setObjectName('contrastDockWidget')
+        contrastDockWidget.setAllowedAreas(Qt.LeftDockWidgetArea)
+        contrastDockWidget.setWidget(self.contrastWidget)
+        self.addDockWidget(Qt.LeftDockWidgetArea, contrastDockWidget)
+
         #Set MCU - micro control unit - as initial dock widget
         self.mcuWidget = MCUWidget()
-
+        self.mcuWidget.setAutoFillBackground(True)
+        #self.mcuWidget.setPalette(dockPalette)
+        
         mcuDockWidget = QDockWidget('MCU Settings', self)
         mcuDockWidget.setObjectName('mcuDockWidget')
         mcuDockWidget.setAllowedAreas(Qt.LeftDockWidgetArea)
         mcuDockWidget.setWidget(self.mcuWidget)
         self.addDockWidget(Qt.LeftDockWidgetArea, mcuDockWidget)
+        
+        #Provide reference to the image adjust panel
+        self.mainWindow.BModeTab.setContrastWidget(self.contrastWidget)
+        #self.mainWindow.BModeTab.set...
 
         #Provide reference to the MCU in widgets that require them
         self.mainWindow.BModeTab.setMCU(self.mcuWidget)
         self.mainWindow.MModeTab.setMCU(self.mcuWidget)
 
+        
     def closeEvent(self, event):
         """
         Clean up child widgets before exit
@@ -102,13 +144,13 @@ class MainWindow(QMainWindow):
 
 
 class MainScanWindow(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, dataObject, parent=None):
         super(MainScanWindow, self).__init__(parent)
 
         #All imaging modes access the same data object
-        #This is owned by the MainScanWindow widget and
+        #This is owned by the MainWindow widget and
         #referenced by the individual image mode widgets
-        self.dataObject = HiFUSData()
+        self.dataObject = dataObject
 
 
         #GUI appearance
@@ -186,7 +228,6 @@ class BModeWindow(QWidget):
         #Set "Run" and "Stop" buttons
         self.runButton  = QPushButton("Scan")
         self.stopButton = QPushButton("Stop")
-        self.saveButton = QPushButton("Export RF Data")
 
         #Label to report framerate
         self.frameRate = 0.0
@@ -215,6 +256,7 @@ class BModeWindow(QWidget):
                                            colormap='gist_gray')
 
         #Set the dynamic range
+        self.BSignalRange = dataObject.getBRange()
         imgRange = dataObject.getBRange()
         self.currentImage.set_lut_range(imgRange)
         #Set the plot size and add the image
@@ -227,22 +269,6 @@ class BModeWindow(QWidget):
             plot.setMinimumSize(nativeSize)
         plot.add_item(self.currentImage)
         plot.set_active_item(self.currentImage)
-
-        #Image adjust tools
-        #TODO: Move these to a dock-able toolbox
-
-        #Signal Range
-        self.BSignalRange = dataObject.getBRange()
-        self.BSignalRangeSlider = QSlider(Qt.Horizontal)
-        self.BSignalRangeSlider.setMinimum(0)
-        self.BSignalRangeSlider.setMaximum(self.BSignalRange[1])
-        self.BSignalRangeSlider.setValue(self.BSignalRange[1])
-
-        #Noise Floor
-        self.BNoiseFloorSlider = QSlider(Qt.Horizontal)
-        self.BNoiseFloorSlider.setMinimum(0)
-        self.BNoiseFloorSlider.setMaximum(self.BSignalRange[1])
-        self.BNoiseFloorSlider.setValue(0)
 
         #BMode data averaging
         maxAveragesExp = 3
@@ -261,7 +287,6 @@ class BModeWindow(QWidget):
 
         #Replay
         self.replayWidget = ReplayWidget(self.dataObject)
-
 
         #-----------
         # GUI layout
@@ -291,19 +316,6 @@ class BModeWindow(QWidget):
         line.setFrameStyle(QFrame.HLine)
         grid.addWidget(line)
         row += 1
-
-        grid.addWidget(QLabel("Noise Floor Adjust (dB):"),row,0)
-        row += 1
-        grid.addWidget(self.BNoiseFloorSlider)
-        self.BNoiseFloorSlider.setSizePolicy(QSizePolicy(QSizePolicy.Preferred))
-        row += 1
-
-        grid.addWidget(QLabel("Maximum Signal Adjust (dB):"),row,0)
-        row += 1
-        grid.addWidget(self.BSignalRangeSlider)
-        self.BSignalRangeSlider.setSizePolicy(QSizePolicy(QSizePolicy.Preferred))
-        row += 1
-
         grid.addWidget(QLabel('Averaging :'),row,0)
         row += 1
         grid.addWidget(self.averageComboBox, row,0)
@@ -327,9 +339,9 @@ class BModeWindow(QWidget):
         grid.addLayout(plotHSpacer, row, 0)
         row += 1
 
-        self.saveButton.setSizePolicy(QSizePolicy(QSizePolicy.Preferred))
-        grid.addWidget(self.saveButton)
-        row += 1
+        #self.saveButton.setSizePolicy(QSizePolicy(QSizePolicy.Preferred))
+        #grid.addWidget(self.saveButton)
+        #row += 1
 
         self.setLayout(grid)
 
@@ -338,14 +350,12 @@ class BModeWindow(QWidget):
         #------------------
         self.connect(self.runButton,   SIGNAL("clicked()"), self.runBScan)
         self.connect(self.stopButton,  SIGNAL("clicked()"), self.stopBScan)
-        self.connect(self.BSignalRangeSlider, SIGNAL("valueChanged(int)"), self.setBMaxPlotRange)
-        self.connect(self.BNoiseFloorSlider, SIGNAL("valueChanged(int)"), self.setBMinPlotRange)
         self.connect(self.averageComboBox, SIGNAL("currentIndexChanged(int)"), self.setBAverage)
         self.connect(self.flipLRButton, SIGNAL("clicked()"), self.flipLeftRight)
         self.connect(self.gainWidget,  SIGNAL("newTimeGain"), self.setTimeGain)
-        self.connect(self.saveButton,  SIGNAL("clicked()"), self.exportRFData)
         self.connect(self.dataObject,  SIGNAL("newBData"),  self.replot)
         self.connect(self.dataObject,  SIGNAL("faildata"),  self.stopBScan)
+        
 
     def runBScan(self):
         """ Method calls program loop to acquire B mode images """
@@ -408,15 +418,23 @@ class BModeWindow(QWidget):
 
     def replot(self, imageData):
         """ Update all B Mode images and related data display """
+        
         self.currentImageData = imageData
-        self.currentImage.set_data(self.currentImageData)
+
+        #Apply the current image level compression from the look up table (LUT)
+        temp = numpy.take(self.contrastWidget.LUT,\
+                          numpy.array(imageData*255/60,dtype=numpy.uint8))
+                
+        #Apply the adjusted levels to the display data
+        #Leave the data source (dataObject) unaltered
+        self.currentImage.set_data(temp)        
         self.currentImage.set_lut_range(self.BSignalRange)
         plot = self.plotDialog.get_plot()
         plot.replot()
-        #plot.set_active_item(self.currentImage)
-
+        
+        #Report the display rate
         self.curClock = self.fpsClock()
-        self.frameRate = 2.0 / ( self.curClock-self.preClock)
+        self.frameRate = 1.0 / ( self.curClock-self.preClock)
         self.frameRateLabel.setText('{:.1f}'.format(self.frameRate))
         self.preClock = self.curClock
 
@@ -428,18 +446,11 @@ class BModeWindow(QWidget):
         """ Assign a local reference to the scanner MCU """
         self.MCU = MCU
 
-    def exportRFData(self):
-
-        if MULTIPROCESS == True and self.dataObject.alive == True:
-             QMessageBox.warning(self, "User Action Required", "Scanning must be stopped before buffer export.")
-
-        else:
-            #Now save the current data
-            filename = QFileDialog.getSaveFileName(self, 'Save File')
-            if filename != "":
-                outBuffer = self.dataObject.getCurrentBuffer()
-                numpy.save(str(filename), outBuffer)
-
+    def setContrastWidget(self, widget):
+        self.contrastWidget = widget
+        self.connect(self.contrastWidget.BNoiseFloorSlider, SIGNAL("valueChanged(int)"), self.setBMinPlotRange)
+        self.connect(self.contrastWidget.BSignalRangeSlider, SIGNAL("valueChanged(int)"), self.setBMaxPlotRange)
+        
     def setAppearance(self):
         """
         The GuiQWT objects don't repaint when their parents palette
@@ -623,7 +634,160 @@ class ReplayWidget(QWidget):
             video.release()
 
 
+class SessionInfoWidget(QWidget):
 
+    def __init__(self, dataObject, parent=None):
+
+        super(SessionInfoWidget, self).__init__(parent)
+
+        self.dataObject = dataObject
+
+        self.sessionIDEdit = QLineEdit()
+        self.sessionIDEdit.setText(' ')
+        self.sessionViewEdit = QLineEdit()
+        self.sessionViewEdit.setText(' ')
+
+
+        self.date = QDate()
+        self.sessionDateEdit = QLineEdit()        
+        self.sessionDateEdit.setText(self.date.currentDate().toString('yyyy/MM/dd'))
+        self.time = QTime()
+        self.sessionTimeEdit = QLineEdit()
+        self.sessionTimeEdit.setText(self.time.currentTime().toString('hh:mm'))
+
+        self.saveButton = QPushButton("Export RF Data")
+        #self.loadButton = QPushButton("Import RF Data")
+
+        self.updateTimer = QTimer()
+        self.updateTimer.setInterval(1000)
+        self.updateTimer.start()
+
+        VLayout = QVBoxLayout()
+        HLayout = QHBoxLayout()
+        HLayout.addWidget(QLabel('ID:     '))
+        HLayout.addWidget(self.sessionIDEdit)
+        VLayout.addLayout(HLayout)
+        HLayout = QHBoxLayout()
+        HLayout.addWidget(QLabel('Date: '))
+        HLayout.addWidget(self.sessionDateEdit)
+        VLayout.addLayout(HLayout)
+        HLayout = QHBoxLayout()
+        HLayout.addWidget(QLabel('Time: '))
+        HLayout.addWidget(self.sessionTimeEdit)
+        VLayout.addLayout(HLayout)
+        VLayout.addWidget(self.saveButton)
+        #VLayout.addWidget(self.loadButton)
+        VLayout.addStretch()
+
+        self.setLayout(VLayout)
+        
+        self.connect(self.saveButton,  SIGNAL("clicked()"), self.exportRFData)
+        self.connect(self.updateTimer, SIGNAL("timeout()"), self.updateTimeEdit)
+
+
+    def exportRFData(self):
+
+        if MULTIPROCESS == True and self.dataObject.alive == True:
+             QMessageBox.warning(self, "User Action Required", "Scanning must be stopped before buffer export.")
+             return False
+
+        date = str(self.sessionDateEdit.text())
+        date = date.replace('/','_')
+        time = str(self.sessionTimeEdit.text())
+        time = time.replace(':','_')
+
+        defaultName = date + '_' +\
+                      time + '_' +\
+                      str(self.sessionIDEdit.text()) + '_' +\
+                      '.npy'
+        
+        filename = QFileDialog.getSaveFileName(self, 'Save File', defaultName)
+        if filename != "":
+
+            #JRL we should use the h5py library to export numpy arrays with metadata
+            numpy.save(str(filename), self.dataObject.buffers)
+
+            
+    def updateTimeEdit(self):
+        self.sessionTimeEdit.setText(self.time.currentTime().toString('hh:mm'))
+
+
+class ContrastWidget(QWidget):
+    def __init__(self, parent=None):
+        """
+        Widget to adjust grayscale mapping
+        
+        Required Arguments
+
+        dataobject:   Contains buffers and processed data.
+        """
+        super(ContrastWidget, self).__init__(parent)
+
+
+        self.BSignalRange = [0, 60]
+
+        self.BNoiseFloorSlider = QSlider(Qt.Horizontal)
+        self.BNoiseFloorSlider.setMinimum(1)
+        self.BNoiseFloorSlider.setMaximum(60)
+        self.BNoiseFloorSlider.setValue(0)
+
+        self.BSignalRangeSlider = QSlider(Qt.Horizontal)
+        self.BSignalRangeSlider.setMinimum(1)
+        self.BSignalRangeSlider.setMaximum(60)
+        self.BSignalRangeSlider.setValue(60)
+
+
+        self.SCompressionCheckBox = QCheckBox('S-Compression')
+
+        self.sigmaSlider = QSlider(Qt.Horizontal)
+        self.sigmaSlider.setMinimum(1)
+        self.sigmaSlider.setMaximum(60)
+        self.sigmaSlider.setValue(15)
+
+        self.centerSlider = QSlider(Qt.Horizontal)
+        self.centerSlider.setMinimum(1)
+        self.centerSlider.setMaximum(60)
+        self.centerSlider.setValue(30)
+
+        self.setLUT()
+
+        #Layout
+
+        VLayout = QVBoxLayout()
+        VLayout.addWidget(QLabel('Noise (dB):'))
+        VLayout.addWidget(self.BNoiseFloorSlider)
+        VLayout.addWidget(QLabel('Maximum (dB):'))
+        VLayout.addWidget(self.BSignalRangeSlider)
+        VLayout.addWidget(self.SCompressionCheckBox)
+        VLayout.addWidget(QLabel('Sigma (dB):'))
+        VLayout.addWidget(self.sigmaSlider)
+        VLayout.addWidget(QLabel('Center (dB):'))
+        VLayout.addWidget(self.centerSlider)
+        VLayout.addStretch()
+        
+        self.setLayout(VLayout)
+
+        #Signals and slots
+
+        self.connect(self.sigmaSlider, SIGNAL("sliderReleased()"), self.setLUT)
+        self.connect(self.centerSlider, SIGNAL("sliderReleased()"), self.setLUT)
+        self.connect(self.SCompressionCheckBox, SIGNAL("stateChanged(int)"), self.setLUT)
+
+    def setLUT(self):
+
+        minVal = self.BNoiseFloorSlider.value()
+        maxVal = self.BSignalRangeSlider.value()
+        sigma = self.sigmaSlider.value()
+        center = self.centerSlider.value()
+
+        if self.SCompressionCheckBox.isChecked() is True:
+            x = numpy.linspace(minVal,maxVal,256)
+            cdf = scipy.stats.norm.cdf((x-center)/sigma)
+            self.LUT = (cdf-numpy.min(cdf))*maxVal/(numpy.max(cdf)-numpy.min(cdf))
+        else:
+            self.LUT = numpy.linspace(0,60,256)
+
+        
 
 
 class MModeWindow(QWidget):
@@ -1132,7 +1296,6 @@ class RFWindow(QWidget):
         self.MCU = MCU
 
 
-
 class simpleCurveDialog(CurveDialog):
     """
     Method override to remove "OK" & "Cancel" buttons
@@ -1167,6 +1330,8 @@ class HiFUSData(QObject):
 
         trigDelay = 6.0E-03*(2.0/1500.)
         DAQ.SetTriggerDelaySec(trigDelay)
+
+        #DAQ.SetExternalClock()
 
         #Store settings
         self.numBuffers   = bufferCnt
@@ -1394,8 +1559,8 @@ class HiFUSData(QObject):
         self.BVideoTimer.start()
 
     def emitBVideoFrame(self):
-        BData = self.BVideo[self.BVideoIndex,:,:]
-        self.emit(SIGNAL('newBData'), BData)
+        self.BData = self.BVideo[self.BVideoIndex,:,:]
+        self.emit(SIGNAL('newBData'), self.BData)
         self.emit(SIGNAL('newBVideo'), self.BVideoIndex)
         self.BVideoIndex += 1
         self.BVideoIndex = self.BVideoIndex % self.BVideoLength
@@ -1523,7 +1688,7 @@ class HiFUSData(QObject):
                 self.emit(SIGNAL('newMData'), dataPackage)
 
             if self.emitRF == True:
-                self.RFData[1,:] = self.buffers[bufIndex-1, self.RFDataStart:self.RFDataStop]*1.2210012210012e-02 - 398.73
+                self.RFData[1,:] = self.buffers[bufIndex-1, self.RFDataStart:self.RFDataStop]*1.2210012210012e-02 - (400.-1.06)
                 self.emit(SIGNAL('newRFData'), self.RFData)
 
             QApplication.processEvents()
@@ -1680,6 +1845,7 @@ def CollectProcess(childSocket, \
     DAQ.SetBufferRecordSampleCount(bufferCnt,recordCnt,sampleCnt)
     boardHandle = DAQ.GetBoardHandle(1,1)
     DAQ.SetTriggerDelaySec(trigDelay)
+    #DAQ.SetExternalClock()
     acquireData = DAQ.AcquireBuffers
 
 
@@ -1781,13 +1947,13 @@ def CollectProcess(childSocket, \
 
         MData[:] = numpy.roll(MData, 1)
         MData[:,0] = BData[:,BLines/2-1]
-        RFData[1,:] = buffers[bufIndex, RFStart:RFStop]*1.2210012210012e-02 - 398.7
+        RFData[1,:] = buffers[bufIndex, RFStart:RFStop]*1.2210012210012e-02 - (400.-1.06)
         bufIndex += bufPerAcq
         bufIndex  = bufIndex % bufferCnt
 
         #Check if the parent wants new data
         #Optional frame skip incase display can't keep up with processing
-        if (bufIndex%2 == 0):
+        if (bufIndex%1 == 0):
             if childSocket.poll() == True:
                 cmd = childSocket.recv()
                 #First populate the shared array with new data
@@ -2072,7 +2238,7 @@ class DummyHardware(object):
 
         sigAmp = 50
         sigRange = 2**16
-        tempRF = numpy.random.randint(-sigAmp, sigAmp, (bufPerAcq,buffers.shape[1]) ) + 0.5*sigRange
+        tempRF = numpy.random.rand(bufPerAcq,buffers.shape[1])*sigAmp + 0.5*sigRange
 
         buffers[a:b,:] = numpy.array(tempRF, dtype=buffers.dtype)
 
@@ -2178,6 +2344,64 @@ def dataToBMode(data, imageData, imageDepth, imageLines):
     return True
 
 
+class SectorScanMap(object):
+
+    def __init__(self, parent=None):
+        
+        #Source array (polar)       
+        nphi = 64
+        phimin = -31
+        phimax = 32
+        phi = numpy.linspace(phimin,phimax,nphi)
+        nr = 208
+        rmin = 3.00E-03
+        rmax = 9.24E-03
+        r = numpy.linspace(rmin,rmax,nr)
+        
+        #Destination array (cartesian)
+        nx = 200
+        xmin = -5.0E-03
+        xmax =  5.0E-03
+        x = numpy.linspace(xmin,xmax,nx)
+        nz = 225
+        zmin = 2.5E-03
+        zmax = 9.25E-03
+        z = numpy.linspace(zmin,zmax,nz)
+        
+        dst = numpy.zeros([nz, nx])
+        self.dst = dst
+        rdst = numpy.zeros_like(dst)
+        phidst = numpy.zeros_like(dst)
+        
+        
+        #Now specify the location of each pixel in the 
+        #destination array (x,z cartesian) in the 
+        #coordinate system of the source array(r,phi polar)
+        for i in range(nz):
+            for j in range(nx):
+                rdst[i,j] = (z[i]**2 + x[j]**2)**0.5
+                phidst[i,j] = numpy.arctan(x[j]/z[i])*180/pi
+        
+        #Normalize the destination -> source mapping         
+        map1 = numpy.zeros([nz, nx],dtype=numpy.float32)
+        map1[:,:] = (phidst-phimin)/(phimax-phimin) * nphi
+        self.map1 = map1
+        
+        map2 = numpy.zeros([nz, nx],dtype=numpy.float32)
+        map2[:,:] = (rdst-rmin)/(rmax-rmin) * nr
+        self.map2 = map2
+    
+    def render(self, src):
+        dst = cv2.remap(src, self.map1, self.map2, \
+                        interpolation=cv2.INTER_CUBIC, \
+                        borderMode=cv2.BORDER_CONSTANT, \
+                        borderValue = 0.)
+                        
+        dst[dst<0] = 0.
+        
+        return dst
+
+
 def frequencySpectrum(xData,yData,timebase=1.0E+06):
     """
     Generate the frequency vector for the fft
@@ -2244,20 +2468,19 @@ class MCUWidget(QWidget):
         self.scanAmpSpinBox.setValue(.20)
 
         self.scanFreqSpinBox = QDoubleSpinBox()
-        self.scanFreqSpinBox.setRange(94.0, 97.0)
-        self.scanFreqSpinBox.setDecimals(2)
-        self.scanFreqSpinBox.setSingleStep(0.01)
+        self.scanFreqSpinBox.setRange(60.0, 100.0)
+        self.scanFreqSpinBox.setDecimals(0)
+        self.scanFreqSpinBox.setSingleStep(1.00)
         self.scanFreqSpinBox.setSuffix(" Hz")
-        self.scanFreqSpinBox.setValue(95.75)
-        #FPGA timer generation is at 400 MHz on 2**22 counter loop
-        #400E+06 / 2** 22 = 95.37
+        self.scanFreqSpinBox.setValue(62.0)
+
 
         self.scanPhaseSpinBox = QDoubleSpinBox()
         self.scanPhaseSpinBox.setRange(0.0, 360.0)
         self.scanPhaseSpinBox.setDecimals(0)
-        self.scanPhaseSpinBox.setSingleStep(1)
+        self.scanPhaseSpinBox.setSingleStep(5)
         self.scanPhaseSpinBox.setSuffix(" Deg")
-        self.scanPhaseSpinBox.setValue(310.0)
+        self.scanPhaseSpinBox.setValue(65.0)
 
         #Bimorph scan (DC)
         self.DCButton = QPushButton("DC Scan")
@@ -2508,6 +2731,7 @@ class MCU(serial.Serial):
     def sendEcho(self, echoCode):
         self._send(self.opCode['ECHO'], echoCode, self.fmtCode['ushort'])
         return self.readline()
+    
 
 try:
     import PyDaxAlazar as DAQ
